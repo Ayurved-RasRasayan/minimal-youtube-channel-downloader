@@ -283,6 +283,8 @@ function saveChannel(channelId, channel) {
 /**
  * Save all channels to SQLite (full sync).
  * This is the replacement for the old saveDatabase() that wrote the entire JSON.
+ * ⚠️ SLOW: O(channels × videos) per call. Use saveChannel() or saveVideo()
+ *    for incremental updates whenever possible.
  * @param {Map<string, object>} channelsMap
  */
 function saveAllChannels(channelsMap) {
@@ -295,6 +297,136 @@ function saveAllChannels(channelsMap) {
     });
 
     saveAll();
+}
+
+/**
+ * ⭐ PERF: Save just the channel-level metadata (no videos).
+ * Use this when only channel fields like lastChecked / videoCount / name
+ * changed — avoids re-inserting every video row.
+ * @param {string} channelId
+ * @param {object} channel - Channel object (videos array ignored if present)
+ */
+function saveChannelMetadata(channelId, channel) {
+    if (!db) initDatabase();
+
+    const insertChannel = db.prepare(`
+        INSERT OR REPLACE INTO channels (id, youtubeId, url, name, handle, videoCount, lastChecked, createdAt)
+        VALUES (@id, @youtubeId, @url, @name, @handle, @videoCount, @lastChecked, @createdAt)
+    `);
+
+    insertChannel.run({
+        id: channelId,
+        youtubeId: channel.youtubeId || null,
+        url: channel.url || null,
+        name: channel.name || null,
+        handle: channel.handle || null,
+        videoCount: channel.videoCount || (channel.videos ? channel.videos.length : 0),
+        lastChecked: channel.lastChecked || null,
+        createdAt: channel.createdAt || new Date().toISOString()
+    });
+}
+
+/**
+ * ⭐ PERF: Save/update a single video row.
+ * Used when only one video's status/filename changed (the most common case
+ * during downloads). O(1) instead of O(channel video count).
+ * @param {string} channelId - Parent channel ID
+ * @param {object} video - Video object (id required, other fields optional)
+ */
+function saveVideo(channelId, video) {
+    if (!db) initDatabase();
+
+    const vidId = video.id || video.videoId;
+    if (!vidId) {
+        console.warn('[Database] saveVideo: video has no id, skipping');
+        return;
+    }
+
+    const insertVideo = db.prepare(`
+        INSERT OR REPLACE INTO videos (id, channelId, title, duration, views, uploadDate, finalFilename, sanitizedBase, durationSuffix, displayTitle, downloadStatus, syncStatus, filePath, isDuplicate, isLiveStream, isPremiere)
+        VALUES (@id, @channelId, @title, @duration, @views, @uploadDate, @finalFilename, @sanitizedBase, @durationSuffix, @displayTitle, @downloadStatus, @syncStatus, @filePath, @isDuplicate, @isLiveStream, @isPremiere)
+    `);
+
+    insertVideo.run({
+        id: vidId,
+        channelId: channelId,
+        title: video.title || null,
+        duration: video.duration || null,
+        views: video.views || null,
+        uploadDate: video.uploadDate || null,
+        finalFilename: video.finalFilename || null,
+        sanitizedBase: video.sanitizedBase || null,
+        durationSuffix: video.durationSuffix || null,
+        displayTitle: video.displayTitle || null,
+        downloadStatus: video.downloadStatus || null,
+        syncStatus: video.syncStatus || null,
+        filePath: video.filePath || null,
+        isDuplicate: video.isDuplicate ? 1 : 0,
+        isLiveStream: video.isLiveStream ? 1 : 0,
+        isPremiere: video.isPremiere ? 1 : 0
+    });
+}
+
+/**
+ * ⭐ PERF: Patch a single field on a single video row.
+ * Use this for the post-download rename case where only `finalFilename` changed.
+ * @param {string} videoId
+ * @param {object} patch - {field: value, ...} — only these fields get UPDATEd
+ */
+function patchVideoFields(videoId, patch) {
+    if (!db) initDatabase();
+    if (!videoId || !patch || Object.keys(patch).length === 0) return;
+
+    // Whitelist allowed columns to prevent SQL injection
+    const ALLOWED = new Set([
+        'title', 'duration', 'views', 'uploadDate',
+        'finalFilename', 'sanitizedBase', 'durationSuffix', 'displayTitle',
+        'downloadStatus', 'syncStatus', 'filePath',
+        'isDuplicate', 'isLiveStream', 'isPremiere'
+    ]);
+
+    const sets = [];
+    const values = {};
+    for (const [k, v] of Object.entries(patch)) {
+        if (!ALLOWED.has(k)) continue;
+        // Map JS boolean → SQLite integer for the is* fields
+        const value = (k === 'isDuplicate' || k === 'isLiveStream' || k === 'isPremiere')
+            ? (v ? 1 : 0)
+            : v;
+        sets.push(`${k} = @${k}`);
+        values[k] = value;
+    }
+    if (sets.length === 0) return;
+
+    values.id = videoId;
+    db.prepare(`UPDATE videos SET ${sets.join(', ')} WHERE id = @id`).run(values);
+}
+
+/**
+ * ⭐ PERF: Patch a single field on a channel row (no video rows touched).
+ * @param {string} channelId
+ * @param {object} patch - {field: value, ...}
+ */
+function patchChannelFields(channelId, patch) {
+    if (!db) initDatabase();
+    if (!channelId || !patch || Object.keys(patch).length === 0) return;
+
+    const ALLOWED = new Set([
+        'youtubeId', 'url', 'name', 'handle',
+        'videoCount', 'lastChecked', 'createdAt'
+    ]);
+
+    const sets = [];
+    const values = {};
+    for (const [k, v] of Object.entries(patch)) {
+        if (!ALLOWED.has(k)) continue;
+        sets.push(`${k} = @${k}`);
+        values[k] = v;
+    }
+    if (sets.length === 0) return;
+
+    values.id = channelId;
+    db.prepare(`UPDATE channels SET ${sets.join(', ')} WHERE id = @id`).run(values);
 }
 
 /**
@@ -322,6 +454,10 @@ module.exports = {
     loadDatabase,
     saveChannel,
     saveAllChannels,
+    saveChannelMetadata,
+    saveVideo,
+    patchVideoFields,
+    patchChannelFields,
     deleteChannel,
     closeDatabase,
     getDb: () => db

@@ -4161,12 +4161,15 @@
 
         function startServerLogPolling() {
             if (serverLogInterval) return;
-            
+
+            // ⭐ PERF: poll every 5s instead of 2s — server logs aren't
+            // time-critical and the previous 2s rate caused excess CPU/IO
+            // when the user had the server-log tab open in the background.
             serverLogInterval = setInterval(() => {
                 if (currentLogTab === 'server') {
                     fetchServerLogs();
                 }
-            }, 2000);
+            }, 5000);
         }
 
         function stopServerLogPolling() {
@@ -5979,15 +5982,29 @@
         
         function startPolling() {
             if (pollingInterval) return;
-            
-            pollingInterval = setInterval(async () => {
+
+            // ⭐ PERF: adaptive polling — 1s while downloads are active,
+            // 3s while queue has pending items, 10s when idle.
+            // (Was: fixed 2s — wasted CPU/bandwidth when nothing was happening.)
+            const tick = async () => {
                 await refreshQueue();
-            }, 2000);
+                // Determine next interval based on current state
+                let nextDelay = 10000;  // idle default
+                if (videos.some(v => v.downloadStatus === 'downloading')) {
+                    nextDelay = 1000;   // active download — fast updates
+                } else if (downloadQueue.active && downloadQueue.active.length > 0) {
+                    nextDelay = 1000;
+                } else if (downloadQueue.queue && downloadQueue.queue.length > 0) {
+                    nextDelay = 3000;   // queue has pending — medium rate
+                }
+                pollingInterval = setTimeout(tick, nextDelay);
+            };
+            pollingInterval = setTimeout(tick, 1000);  // first tick after 1s
         }
 
         function stopPolling() {
             if (pollingInterval) {
-                clearInterval(pollingInterval);
+                clearTimeout(pollingInterval);
                 pollingInterval = null;
             }
         }
@@ -6573,18 +6590,17 @@
             saveChannels(); // Persist channels
         });
         
-        // Live progress sync (for showing real-time download progress)
+        // Live progress sync — DEPRECATED.
+        // ⭐ PERF: the main startPolling() now adaptively polls at 1s during
+        // active downloads, so this separate 1s timer was redundant (caused
+        // double-fetches every second during downloads).
+        // Kept as no-op stubs so existing call sites don't break.
         let liveProgressInterval = null;
-        
+
         function startLiveProgressSync() {
-            if (liveProgressInterval) return;
-            liveProgressInterval = setInterval(() => {
-                if (videos.some(v => v.downloadStatus === 'downloading')) {
-                    refreshQueue();
-                }
-            }, 1000);
+            // No-op — main poller handles this now.
         }
-        
+
         function stopLiveProgressSync() {
             if (liveProgressInterval) {
                 clearInterval(liveProgressInterval);
