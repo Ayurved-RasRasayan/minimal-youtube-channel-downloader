@@ -688,6 +688,288 @@ function autoExtractCookiesViaPython(options = {}) {
     });
 }
 
+// =============================================================================
+// ⭐⭐⭐ STRATEGY 4 — Refresh cookies via Edge browse (auto-recovery) ⭐⭐⭐
+// =============================================================================
+//
+// When all 3 standard strategies fail (no-cookies / cookies.txt / browser-extract),
+// Strategy 4 launches the user's REAL, logged-in Edge profile via Playwright
+// (headed), navigates to YouTube, clicks a RANDOM video, waits for cookie XHRs
+// to settle, cleanly closes the browser so cookies get flushed to Edge's SQLite
+// DB, then calls autoExtractCookiesViaPython() to rewrite cookies.txt from that
+// freshly populated DB. After that, we retry Strategy 2 (cookies.txt) once.
+//
+// Why a persistent (not throwaway) Edge profile is required:
+//   The user is signed into Google in their normal Edge profile — that's where
+//   SID, SSID, __Secure-3PSID, LOGIN_INFO live. A fresh temp profile has zero
+//   YouTube auth → useless for age-restricted downloads.
+//
+// Why headed (not headless):
+//   Headless Chromium uses a separate profile by default and won't have the
+//   Google login, even when pointing at the same userDataDir.
+//
+// Why the 5-minute cooldown:
+//   If 50 age-restricted videos are queued, Strategy 4 would otherwise open
+//   Edge 50 times. With cooldown, it opens once, refreshes cookies.txt, and
+//   subsequent calls skip the browse step and just retry Strategy 2 against
+//   the fresh file.
+//
+// Why "refuse if Edge is already running":
+//   Playwright's launchPersistentContext cannot acquire the profile lock while
+//   a normal Edge window is open. It would either crash or open a throwaway
+//   profile with no Google login. We refuse with an actionable log instead.
+
+const STRATEGY4_COOLDOWN_MS = 5 * 60 * 1000;   // 5 minutes
+let _strategy4LastRunAt = 0;                    // 0 = never run
+let _strategy4InProgress = false;               // dedup concurrent invocations
+
+/**
+ * Find the system's Microsoft Edge binary.
+ * @returns {string|null} Absolute path to msedge executable, or null if not found.
+ */
+function getEdgeBinaryPath() {
+    const candidates = process.platform === 'win32'
+        ? [
+            'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+            'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
+        ]
+        : process.platform === 'darwin'
+            ? ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge']
+            : ['/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable', '/usr/bin/microsoft-edge-dev'];
+    return candidates.find(p => {
+        try { return fs.existsSync(p); } catch { return false; }
+    }) || null;
+}
+
+/**
+ * Find the user's real Edge profile directory (per-OS).
+ * This is the directory Playwright's launchPersistentContext(userDataDir) needs.
+ * @returns {string|null}
+ */
+function getEdgeUserDataDir() {
+    const home = os.homedir();
+    if (process.platform === 'win32') {
+        const localAppData = process.env.LOCALAPPDATA
+            || path.join(home, 'AppData', 'Local');
+        return path.join(localAppData, 'Microsoft', 'Edge', 'User Data');
+    }
+    if (process.platform === 'darwin') {
+        return path.join(home, 'Library', 'Application Support', 'Microsoft Edge');
+    }
+    return path.join(home, '.config', 'microsoft-edge');
+}
+
+/**
+ * Detect whether Microsoft Edge is currently running.
+ * Uses tasklist on Windows, pgrep on mac/linux. Cheap and dependency-free.
+ * @returns {boolean}
+ */
+function isEdgeRunning() {
+    try {
+        if (process.platform === 'win32') {
+            const out = execSync('tasklist /FI "IMAGENAME eq msedge.exe" /NH',
+                { encoding: 'utf-8', windowsHide: true, timeout: 5000 });
+            return /msedge\.exe/i.test(out);
+        }
+        // mac & linux
+        const cmd = process.platform === 'darwin'
+            ? 'pgrep -x "Microsoft Edge" || pgrep -x "Microsoft Edge Helper"'
+            : 'pgrep -x "msedge" || pgrep -x "microsoft-edge" || pgrep -x "microsoft-edge-stable"';
+        const out = execSync(cmd, { encoding: 'utf-8', timeout: 5000 });
+        return out.trim().length > 0;
+    } catch {
+        // Non-zero exit from tasklist/pgrep = no matches = Edge NOT running
+        return false;
+    }
+}
+
+/**
+ * ⭐ Strategy 4 entry point — refresh cookies.txt by opening Edge, browsing a
+ * random YouTube video, then re-extracting cookies from Edge's DB.
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.force=false] — bypass env-gate and cooldown (for manual UI trigger)
+ * @returns {Promise<{success: boolean, reason?: string, cookiePath?: string,
+ *                     message?: string, cooldownSecondsLeft?: number,
+ *                     criticalCookiesPresent?: boolean}>}
+ */
+async function refreshCookiesViaEdgeBrowse({ force = false } = {}) {
+    // (1) Dedup — don't run two browse flows concurrently
+    if (_strategy4InProgress) {
+        return { success: false, reason: 'already_in_progress' };
+    }
+
+    // (2) Env gate (skipped when force=true, i.e. manual UI trigger)
+    if (!force && process.env.YTL_STRATEGY4_ENABLED === '0') {
+        console.log('[Strategy4] 🚫 Disabled by env var YTL_STRATEGY4_ENABLED=0');
+        return { success: false, reason: 'disabled_by_env' };
+    }
+
+    // (3) Cooldown check (skipped when force=true)
+    const elapsed = Date.now() - _strategy4LastRunAt;
+    if (!force && elapsed < STRATEGY4_COOLDOWN_MS) {
+        const remaining = Math.ceil((STRATEGY4_COOLDOWN_MS - elapsed) / 1000);
+        console.log(`[Strategy4] ⏭️ Cooldown active — ${remaining}s left, skipping browse step`);
+        return {
+            success: false,
+            reason: 'cooldown',
+            cooldownSecondsLeft: remaining,
+            // Caller can still retry Strategy 2 with whatever cookies.txt
+            // currently exists — it may have been refreshed by a previous run.
+            message: `Strategy 4 cooldown (${remaining}s left). Retrying with current cookies.txt.`
+        };
+    }
+
+    // (4) OS gate — skip on headless Linux (Docker / WSL without display)
+    if (process.platform === 'linux'
+        && !process.env.DISPLAY
+        && !process.env.WAYLAND_DISPLAY) {
+        console.log('[Strategy4] ⚠️ No DISPLAY/WAYLAND_DISPLAY — skipping on headless Linux');
+        return { success: false, reason: 'headless_linux' };
+    }
+
+    // (5) Edge installed?
+    const edgePath = getEdgeBinaryPath();
+    if (!edgePath) {
+        console.log('[Strategy4] ⚠️ Microsoft Edge binary not found on this system');
+        return { success: false, reason: 'edge_not_installed' };
+    }
+
+    // (6) Edge profile exists?
+    const userDataDir = getEdgeUserDataDir();
+    if (!fs.existsSync(userDataDir)) {
+        console.log(`[Strategy4] ⚠️ Edge user data dir not found: ${userDataDir}`);
+        return { success: false, reason: 'edge_profile_missing' };
+    }
+
+    // (7) Edge already running? → refuse (Playwright can't acquire profile lock)
+    if (isEdgeRunning()) {
+        const msg = 'Microsoft Edge is already running. Close all Edge windows and retry — Strategy 4 cannot acquire the profile lock while Edge is open.';
+        console.log('[Strategy4] ⚠️ ' + msg);
+        return {
+            success: false,
+            reason: 'edge_already_open',
+            message: msg
+        };
+    }
+
+    // (8) Load Playwright (lazy require so server still boots if not installed)
+    let playwright;
+    try {
+        playwright = require('playwright');
+    } catch {
+        console.log('[Strategy4] ⚠️ playwright is not installed (run: npm i playwright)');
+        return { success: false, reason: 'playwright_not_installed' };
+    }
+
+    _strategy4InProgress = true;
+    console.log('[Strategy4] 🚀 Launching Edge (headed, persistent profile)...');
+    console.log(`[Strategy4]    Edge binary: ${edgePath}`);
+    console.log(`[Strategy4]    User data:  ${userDataDir}`);
+
+    let context;
+    try {
+        context = await playwright.chromium.launchPersistentContext(userDataDir, {
+            channel: 'msedge',
+            executablePath: edgePath,
+            headless: false,
+            viewport: { width: 1280, height: 720 },
+            locale: 'en-US',
+            timeout: 60_000
+        });
+    } catch (err) {
+        _strategy4InProgress = false;
+        console.error('[Strategy4] ❌ Edge launch failed:', err.message);
+        return {
+            success: false,
+            reason: 'launch_failed',
+            error: err.message
+        };
+    }
+
+    try {
+        const page = await context.newPage();
+
+        // 4c-1: load YouTube homepage
+        console.log('[Strategy4] 🌐 Navigating to https://www.youtube.com');
+        await page.goto('https://www.youtube.com',
+            { waitUntil: 'domcontentloaded', timeout: 30_000 });
+
+        // 4c-2: wait for thumbnails to render
+        await page.waitForSelector('ytd-rich-item-renderer',
+            { timeout: 15_000 });
+
+        // 4c-3: collect visible watch-page links
+        const videoHrefs = await page.$$eval(
+            'a[href^="/watch?v="]',
+            links => links.slice(0, 40).map(a => a.href)
+        );
+
+        if (!videoHrefs.length) {
+            console.log('[Strategy4] ⚠️ No video links found on YouTube homepage');
+            return { success: false, reason: 'no_videos_on_homepage' };
+        }
+
+        // 4c-4: pick a RANDOM video (your choice #7)
+        const randomUrl = videoHrefs[Math.floor(Math.random() * videoHrefs.length)];
+        console.log(`[Strategy4] 🎲 Random video: ${randomUrl}`);
+
+        // 4c-5: navigate to the random watch page
+        await page.goto(randomUrl,
+            { waitUntil: 'domcontentloaded', timeout: 30_000 });
+
+        // 4c-6: wait 8 seconds for cookie-rotation XHRs to settle
+        console.log('[Strategy4] ⏳ Waiting 8s for cookie rotation XHRs...');
+        await page.waitForTimeout(8_000);
+
+        // 4c-7: clean close — flushes Edge's in-memory cookies to SQLite DB
+        console.log('[Strategy4] 🔒 Closing Edge (flushing cookie DB to disk)');
+        await context.close();
+        context = null;
+
+        // Small grace period — Edge's background process needs a moment to
+        // release the SQLite lock after context.close() returns.
+        await new Promise(r => setTimeout(r, 1500));
+    } catch (err) {
+        console.error('[Strategy4] ❌ Browse step failed:', err.message);
+        // Best-effort cleanup
+        try { if (context) await context.close(); } catch {}
+        _strategy4InProgress = false;
+        return { success: false, reason: 'browse_failed', error: err.message };
+    }
+
+    // (9) Re-extract cookies → cookies.txt (existing function handles DPAPI,
+    //     Netscape format, .bak backup, critical-cookie verification, and
+    //     invalidates the cookies.txt validation cache on success.)
+    console.log('[Strategy4] 🐍 Spawning extract_cookies.py to re-extract cookies.txt');
+    const extractResult = await autoExtractCookiesViaPython({ browser: 'edge' });
+
+    _strategy4InProgress = false;
+    _strategy4LastRunAt = Date.now();
+
+    if (!extractResult.success) {
+        console.error('[Strategy4] ❌ Cookie extraction failed:',
+            extractResult.error || 'unknown');
+        return {
+            success: false,
+            reason: 'extract_failed',
+            error: extractResult.error
+        };
+    }
+
+    // (10) Re-validate — autoExtractCookiesViaPython already invalidated the
+    //      cache, so isCookiesFileValid() will do a fresh check.
+    const validNow = isCookiesFileValid(true);
+    console.log(`[Strategy4] ${validNow ? '✅' : '⚠️'} cookies.txt is ${validNow ? 'valid' : 'invalid format'} after refresh`);
+
+    return {
+        success: validNow,
+        reason: validNow ? 'refreshed' : 'extracted_but_invalid',
+        cookiePath: extractResult.cookiePath,
+        criticalCookiesPresent: validNow
+    };
+}
+
 /**
  * Build MULTIPLE yt-dlp commands with different cookie strategies
  * Returns array of commands to try in order of preference
@@ -736,6 +1018,21 @@ function buildCommandsWithCookieStrategies(baseUrl, url) {
         type: 'browser'
     });
     console.log('[commands] Strategy 3: Browser fallback (' + browser + ')');
+
+    // ⭐ Strategy 4: Refresh cookies via Edge browse (auto-recovery).
+    // This is a sentinel — executeWithRetry() intercepts `type === 'refresh'`
+    // BEFORE calling exec() and runs refreshCookiesViaEdgeBrowse() instead.
+    // On success, the call site retries Strategy 2 (cookies.txt) against the
+    // freshly written file. We also stash baseUrl + url so the retry can
+    // rebuild the strategy array after cookies.txt is regenerated.
+    strategies.push({
+        cmd: '__STRATEGY4_REFRESH__',   // sentinel — never executed as a shell command
+        description: 'Refresh cookies via Edge browse (Strategy 4)',
+        type: 'refresh',
+        baseUrl: baseUrl,                // preserved for retry-after-refresh
+        url: url
+    });
+    console.log('[commands] Strategy 4: Refresh cookies via Edge browse (auto-recovery)');
     
     console.log('[commands] Total strategies prepared:', strategies.length);
     
@@ -756,6 +1053,87 @@ function executeWithRetry(strategies, currentIndex, onSuccess, onError) {
     }
     
     const strategy = strategies[currentIndex];
+
+    // ⭐⭐⭐ STRATEGY 4 INTERCEPT ⭐⭐⭐
+    // The refresh sentinel is NOT a shell command — it triggers the Playwright
+    // browse flow, then retries Strategy 2 (cookies.txt) against the freshly
+    // written cookies.txt.
+    if (strategy.type === 'refresh') {
+        // Loop-prevention: if we've already consumed Strategy 4 in this
+        // download's chain (e.g. refresh ran → Strategy 2 retried → failed →
+        // Strategy 3 retried → failed → looped back to Strategy 4), skip past
+        // it so the chain terminates with a clean reject.
+        if (strategy._consumed) {
+            console.log('[executeWithRetry] ⏭️ Strategy 4 already consumed in this chain — skipping past');
+            executeWithRetry(strategies, currentIndex + 1, onSuccess, onError);
+            return;
+        }
+        strategy._consumed = true;
+
+        console.log('\n[executeWithRetry] 🔄 Strategy 4: Refreshing cookies via Edge browse...');
+        refreshCookiesViaEdgeBrowse().then(result => {
+            if (result.success) {
+                console.log('[executeWithRetry] ✅ Strategy 4 refresh succeeded — retrying Strategy 2 (cookies.txt)');
+
+                // Rebuild the strategy array — cookies.txt may have just been
+                // created for the first time (e.g. it was missing before),
+                // so the array structure could change.
+                const baseUrl = strategy.baseUrl;
+                const url = strategy.url;
+                const freshStrategies = buildCommandsWithCookieStrategies(baseUrl, url);
+
+                // Mark the fresh Strategy 4 entry as consumed so the retry
+                // chain (Strategy 2 → Strategy 3 → Strategy 4) doesn't loop
+                // back into another refresh attempt.
+                const freshRefreshIdx = freshStrategies.findIndex(s => s.type === 'refresh');
+                if (freshRefreshIdx >= 0) {
+                    freshStrategies[freshRefreshIdx]._consumed = true;
+                }
+
+                // Find the cookies.txt strategy in the fresh array.
+                const strat2Idx = freshStrategies.findIndex(s => s.type === 'file');
+                if (strat2Idx >= 0) {
+                    // Retry ONLY Strategy 2 — Strategy 1 (no-cookies) still
+                    // can't fix age-restricted, and Strategy 3 (browser) just
+                    // failed for a DPAPI reason that won't change.
+                    executeWithRetry(freshStrategies, strat2Idx, onSuccess, onError);
+                } else {
+                    // Edge case: refresh reported success but cookies.txt is
+                    // still invalid. Fall through to the final reject.
+                    console.error('[executeWithRetry] ❌ Strategy 4 reported success but cookies.txt still invalid');
+                    onError(new Error('Strategy 4 succeeded but cookies.txt is still invalid'));
+                }
+            } else if (result.reason === 'cooldown') {
+                // Cooldown: cookies.txt may have been refreshed by a recent
+                // Strategy 4 run — retry Strategy 2 against current file.
+                console.log(`[executeWithRetry] ⏭️ Strategy 4 cooldown — retrying Strategy 2 with current cookies.txt (${result.cooldownSecondsLeft}s left in cooldown)`);
+                const freshStrategies = buildCommandsWithCookieStrategies(strategy.baseUrl, strategy.url);
+
+                // Same loop-prevention: mark fresh Strategy 4 as consumed.
+                const freshRefreshIdx = freshStrategies.findIndex(s => s.type === 'refresh');
+                if (freshRefreshIdx >= 0) {
+                    freshStrategies[freshRefreshIdx]._consumed = true;
+                }
+
+                const strat2Idx = freshStrategies.findIndex(s => s.type === 'file');
+                if (strat2Idx >= 0) {
+                    executeWithRetry(freshStrategies, strat2Idx, onSuccess, onError);
+                } else {
+                    onError(new Error('Strategy 4 cooldown + cookies.txt still missing'));
+                }
+            } else {
+                console.error('[executeWithRetry] ❌ Strategy 4 failed (' + result.reason + ')');
+                if (result.message) console.error('[executeWithRetry] ' + result.message);
+                if (result.error) console.error('[executeWithRetry] Detail:', result.error);
+                onError(new Error('Strategy 4 (' + result.reason + '): all cookie strategies failed'));
+            }
+        }).catch(err => {
+            console.error('[executeWithRetry] ❌ Strategy 4 unexpected error:', err.message);
+            onError(err);
+        });
+        return;
+    }
+
     console.log('\n[executeWithRetry] Trying strategy', currentIndex + 1, '/', strategies.length + ':', strategy.description);
     console.log('[executeWithRetry] Command:', strategy.cmd.substring(0, 150) + '...');
     
@@ -2337,7 +2715,49 @@ app.post('/api/cookies/extract', async (req, res) => {
     console.log('\n[Extract Cookies] POST /api/cookies/extract requested');
 
     const browser = (req.body && req.body.browser) || 'auto';
-    console.log(`[Extract Cookies] Browser: ${browser}`);
+    const browse = !!(req.body && req.body.browse);   // ⭐ Strategy 4 manual trigger
+    console.log(`[Extract Cookies] Browser: ${browser}, Browse: ${browse}`);
+
+    // ⭐ Strategy 4 manual trigger — opens Edge, navigates to a random YouTube
+    // video, waits for cookie rotation, then extracts cookies via Python.
+    // Force=true bypasses the cooldown so the user can manually refresh on
+    // demand from the UI.
+    if (browse) {
+        try {
+            const refreshResult = await refreshCookiesViaEdgeBrowse({ force: true });
+            if (refreshResult.success) {
+                // Re-validate the new file (autoExtractCookiesViaPython already
+                // invalidated the cache, so this is a fresh check).
+                const isValid = isCookiesFileValid(false);
+                console.log(`[Extract Cookies] ✅ Strategy 4 manual browse succeeded — cookies.txt is ${isValid ? 'valid' : 'invalid'}`);
+                return res.json({
+                    success: true,
+                    extracted: true,
+                    browsed: true,
+                    cookiePath: refreshResult.cookiePath,
+                    valid: isValid,
+                    reason: refreshResult.reason,
+                    message: `Strategy 4 manual refresh succeeded. cookies.txt is ${isValid ? 'valid' : 'invalid format'}.`
+                });
+            } else {
+                console.log(`[Extract Cookies] ❌ Strategy 4 manual browse failed: ${refreshResult.reason}`);
+                return res.json({
+                    success: false,
+                    extracted: false,
+                    browsed: true,
+                    reason: refreshResult.reason,
+                    message: refreshResult.message || `Strategy 4 failed: ${refreshResult.reason}`,
+                    error: refreshResult.error || null
+                });
+            }
+        } catch (err) {
+            console.error('[Extract Cookies] ❌ Strategy 4 unexpected error:', err.message);
+            return res.status(500).json({
+                success: false,
+                error: 'Strategy 4 unexpected error: ' + err.message
+            });
+        }
+    }
 
     try {
         const result = await autoExtractCookiesViaPython({ browser });
@@ -4602,7 +5022,21 @@ async function executeDownloadWithFormat(downloadId, videoUrl, outputPath, forma
         const browserName = AUTH_CONFIG.browserName || 'edge';
         cookieStrategies.push({
             name: `Browser (${browserName})`,
-            args: ['--cookies-from-browser', browserName]
+            args: ['--cookies-from-browser', browserName],
+            type: 'browser'
+        });
+
+        // ⭐ Strategy 4: Refresh cookies via Edge browse (auto-recovery).
+        // Sentinel entry — intercepted inside tryDownloadWithStrategy()
+        // BEFORE spawning yt-dlp. On success, we rebuild cookieStrategies[]
+        // in place (splicing in a fresh cookies.txt entry) and retry ONLY
+        // Strategy 2 (cookies.txt), since Strategy 1 (no-cookies) still
+        // can't fix age-restricted and Strategy 3 (browser) just failed
+        // for a DPAPI reason that won't change in 15 seconds.
+        cookieStrategies.push({
+            name: 'Refresh cookies via Edge browse (Strategy 4)',
+            args: [],            // not used — sentinel
+            type: 'refresh'
         });
 
         let strategyIdx = 0;
@@ -4618,6 +5052,72 @@ async function executeDownloadWithFormat(downloadId, videoUrl, outputPath, forma
 
             const strategy = cookieStrategies[strategyIdx];
             strategyIdx++;
+
+            // ⭐⭐⭐ STRATEGY 4 INTERCEPT (args-array path) ⭐⭐⭐
+            // The refresh sentinel is NOT a yt-dlp command — it triggers the
+            // Playwright browse flow, then retries Strategy 2 (cookies.txt)
+            // against the freshly written file.
+            if (strategy.type === 'refresh') {
+                // Loop-prevention: if we've already consumed Strategy 4 in this
+                // download's chain (e.g. refresh ran → Strategy 2 retried →
+                // failed → Strategy 3 retried → failed → looped back to
+                // Strategy 4), skip past it so the chain terminates with a
+                // clean reject.
+                if (strategy._consumed) {
+                    console.log('[Execute Download] ⏭️ Strategy 4 already consumed in this chain — skipping past');
+                    tryDownloadWithStrategy();
+                    return;
+                }
+                strategy._consumed = true;
+
+                console.log(`\n[Execute Download] 🔄 Strategy ${strategyIdx}/${cookieStrategies.length}: Refreshing cookies via Edge browse...`);
+                refreshCookiesViaEdgeBrowse().then(refreshResult => {
+                    if (refreshResult.success || refreshResult.reason === 'cooldown') {
+                        // Cooldown or successful refresh — either way, retry
+                        // Strategy 2 (cookies.txt) against the current file.
+                        // First, ensure the cookies.txt entry is present in the
+                        // cookieStrategies[] array. If it was missing before
+                        // (because cookies.txt was missing), splice it in now.
+                        const hasFileStrat = cookieStrategies.some(s => s.type === 'file');
+                        if (!hasFileStrat
+                            && isCookiesFileValid(false)
+                            && fs.existsSync(AUTH_CONFIG.cookieFilePath)) {
+                            // Insert Strategy 2 entry just before this Strategy 4
+                            // entry (which is at index strategyIdx-1) so that
+                            // setting strategyIdx back to that index retries it.
+                            const insertIdx = strategyIdx - 1;
+                            cookieStrategies.splice(insertIdx, 0, {
+                                name: 'cookies.txt file',
+                                args: ['--cookies', AUTH_CONFIG.cookieFilePath],
+                                type: 'file'
+                            });
+                            console.log('[Execute Download] ✅ Spliced cookies.txt entry into strategy array after Strategy 4 refresh');
+                            // Retry the newly inserted Strategy 2 next.
+                            strategyIdx = insertIdx;
+                        } else if (hasFileStrat) {
+                            // Find the existing Strategy 2 entry and retry from there.
+                            const fileIdx = cookieStrategies.findIndex(s => s.type === 'file');
+                            strategyIdx = fileIdx;
+                            console.log(`[Execute Download] ✅ Retrying Strategy 2 (cookies.txt) at index ${fileIdx}`);
+                        } else {
+                            // cookies.txt still missing/invalid even after refresh.
+                            console.error('[Execute Download] ❌ Strategy 4 completed but cookies.txt still missing/invalid');
+                            reject(new Error('Strategy 4 (' + refreshResult.reason + '): cookies.txt still invalid after refresh'));
+                            return;
+                        }
+                        tryDownloadWithStrategy();
+                    } else {
+                        console.error(`[Execute Download] ❌ Strategy 4 failed (${refreshResult.reason})`);
+                        if (refreshResult.message) console.error('[Execute Download] ' + refreshResult.message);
+                        if (refreshResult.error) console.error('[Execute Download] Detail:', refreshResult.error);
+                        reject(new Error('Strategy 4 (' + refreshResult.reason + '): all cookie strategies failed'));
+                    }
+                }).catch(err => {
+                    console.error('[Execute Download] ❌ Strategy 4 unexpected error:', err.message);
+                    reject(err);
+                });
+                return;
+            }
 
             // Build args for this strategy: baseArgs + cookie args + video URL
             const args = baseArgs.concat(strategy.args);
@@ -4856,20 +5356,23 @@ async function executeDownloadWithFormat(downloadId, videoUrl, outputPath, forma
                 // telling the user what's wrong and how to fix it.
                 if (isAuthError && !hasNext) {
                     console.error('\n[Execute Download] ============================================================');
-                    console.error('[Execute Download] ❌ ALL COOKIE STRATEGIES FAILED for age-restricted video');
+                    console.error('[Execute Download] ❌ ALL COOKIE STRATEGIES FAILED (including Strategy 4) for age-restricted video');
                     console.error('[Execute Download] ============================================================');
-                    console.error('[Execute Download] Strategy 1 (no cookies):   failed — age verification required');
+                    console.error('[Execute Download] Strategy 1 (no cookies):    failed — age verification required');
                     console.error('[Execute Download] Strategy 2 (cookies.txt):  failed — your cookies.txt may be');
-                    console.error('[Execute Download]                              expired or missing critical cookies');
-                    console.error('[Execute Download] Strategy 3 (browser edge):  failed — DPAPI decryption issue');
+                    console.error('[Execute Download]                                expired or missing critical cookies');
+                    console.error('[Execute Download] Strategy 3 (browser edge): failed — DPAPI decryption issue');
+                    console.error('[Execute Download] Strategy 4 (refresh):       failed — see [Strategy4] logs above');
+                    console.error('[Execute Download]                                (Edge may be already open, or');
+                    console.error('[Execute Download]                                 Playwright/python3 not installed)');
                     console.error('[Execute Download] ');
                     console.error('[Execute Download] TO FIX:');
-                    console.error('[Execute Download]   1. Open Edge, go to https://www.youtube.com');
-                    console.error('[Execute Download]   2. Sign OUT completely, then sign back in (refresh session)');
-                    console.error('[Execute Download]   3. Browse around for 30s (homepage, subscriptions, watch a video)');
-                    console.error('[Execute Download]   4. Use "Get cookies.txt LOCALLY" browser extension to export');
-                    console.error('[Execute Download]   5. Save to: ' + AUTH_CONFIG.cookieFilePath);
-                    console.error('[Execute Download]   6. Restart the server (auto-repair runs at startup)');
+                    console.error('[Execute Download]   1. CLOSE all Edge windows (Strategy 4 cannot run if Edge is open)');
+                    console.error('[Execute Download]   2. Make sure you are signed into YouTube in Edge');
+                    console.error('[Execute Download]   3. Verify dependencies: npm i playwright  +  pip install browser_cookie3');
+                    console.error('[Execute Download]   4. Optionally trigger Strategy 4 manually:');
+                    console.error('[Execute Download]      curl -X POST http://localhost:' + PORT + '/api/cookies/extract -H "Content-Type: application/json" -d \'{"browse":true}\'');
+                    console.error('[Execute Download]   5. Restart the server (auto-repair runs at startup)');
                     console.error('[Execute Download] ');
                     logMissingAuthCookies();
                     console.error('[Execute Download] ============================================================\n');
